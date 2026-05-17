@@ -812,3 +812,17 @@ Linear journal. Append-only. Each entry: date, one-line summary, what happened, 
   - "New job" button added to the existing /jobs header.
 - **Verification.** 202/202 discipline-suite vitest pass (188 minions+cli + 14 dashboard pattern-parser). `npx tsc --noEmit` clean root + `dashboard/`. Dashboard `/jobs/submit` returns the auth-gate redirect; `/api/intents/parse` returns 401 (auth-gated) — both routes exist and behave correctly. Pre-existing failures in `tests/unit/cli/*` (rebrand-era debt) unchanged.
 - **Phase 1 at ~99%.** Only the LLM-routed intent-parser fallback (deterministic-parser failure → submit synchronous high-priority Minion using subscription engine + system prompt that returns JSON; server polls until terminal, returns parsed intent; +2-3s latency, dashboard credential-free) remains as polish.
+
+### 2026-05-16 — 1M context unlock + threshold-based handoff (system agent, Stage A)
+
+- **Directive (verbatim, Telegram ~00:50Z):** *"Yeah I would say track a session once it reaches 500k do a high quality hand off document with proper reinforcement and then hook to restart a session with that context also go ahead to edit the config to allow 1m 4.7"*
+- **Discovered: zero new code needed.** Existing infrastructure already covers tracking + handoff + restart-with-context: `ctx_warning_threshold` + `ctx_handoff_threshold` config fields, `hook-context-status.ts` statusLine bridge, `FastChecker.checkContextStatus()` Tier 1/2/3 logic, `cortextos bus hard-restart --handoff-doc <path>` plumbing, agent-process boot consumes `.handoff-doc-path` marker and prepends a CONTEXT HANDOFF preamble to the session's first prompt.
+- **The 1M unlock**: cortextos templates set `CLAUDE_CODE_DISABLE_1M_CONTEXT=true` in each agent's `.env` by default for billing safety. Opus 4.7 + Opus 4.6 + Sonnet 4.6 + Mythos Preview have a 1M-token context window natively (no beta header). For Max-plan / Opus, flip to `false`.
+- **Stage A — system agent only.**
+  - `orgs/solo-scale/agents/system/.env`: `CLAUDE_CODE_DISABLE_1M_CONTEXT=false`.
+  - `orgs/solo-scale/agents/system/config.json`: added `"model": "claude-opus-4-7"`, `"ctx_warning_threshold": 45`, `"ctx_handoff_threshold": 50`.
+  - High-quality handoff doc template demonstrated at `orgs/solo-scale/agents/system/memory/handoffs/handoff-2026-05-16T01-56-14Z.md` — uses redundant reinforcement (verbatim directive + restated DOs/DON'Ts repeated at top and bottom) per Jens's "proper reinforcement" ask.
+- **End-to-end self-validation.** The 50% threshold tripped on this very session at 54%, fired the watchdog, wrote the handoff doc, hard-restarted with `--handoff-doc`, and the new session boot prompt injected the CONTEXT HANDOFF preamble. Post-restart `context_status.json` confirms `context_window_size: 1000000`. Full round-trip in <2 min, fully autonomous.
+- **Pending: fleet rollout.** Stage B: replicate the same `.env` + `config.json` change across the other 7 agents (`content`, `finance`, `marketing`, `operations`, `product`, `sales`, `analyst`), each followed by a hard-restart, staggered by 1–2 min to avoid simultaneous reconnect storms. Awaiting Jens's staging-strategy answer before proceeding.
+- **Optional polish (deferred):** enhance the daemon-injected handoff prompt template (`fast-checker.ts:979`) — current is minimal headers; the Stage A handoff doc demonstrates a richer reinforcement pattern that could ship as the default.
+- **No source-code changes.** Pure agent-level config/env. HITL boundary (`src/pty/agent-pty.ts` env allowlist) untouched.
