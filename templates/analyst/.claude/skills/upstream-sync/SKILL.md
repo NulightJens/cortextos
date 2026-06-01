@@ -10,7 +10,7 @@ Check for SOMA framework updates from the remote repository. Never auto-merges. 
 
 ## When to Run
 
-- Daily cron (configured in config.json)
+- Daily cron (configured via `cortextos bus add-cron`)
 - When user asks about updates
 - After hearing about new SOMA features
 

@@ -1,17 +1,21 @@
-import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
+import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from 'fs';
 import { join, relative } from 'path';
 import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramMessage } from '../types/index.js';
 import { AgentProcess } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
+import { CronScheduler } from './cron-scheduler.js';
+import { migrateCronsForAgent } from './cron-migration.js';
+import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
-import { logInboundMessage, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
+import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
+import { stripBom } from '../utils/strip-bom.js';
 
 type LogFn = (msg: string) => void;
 
@@ -19,8 +23,10 @@ type LogFn = (msg: string) => void;
  * Manages all agents in a SOMA instance.
  */
 export class AgentManager {
-  private agents: Map<string, { process: AgentProcess; checker: FastChecker; poller?: TelegramPoller; activityPoller?: TelegramPoller }> = new Map();
+  private agents: Map<string, { process: AgentProcess; checker: FastChecker; poller?: TelegramPoller; activityPoller?: TelegramPoller; telegramRejectCount?: number; telegramLastRejectAlertAt?: number }> = new Map();
   private workers: Map<string, WorkerProcess> = new Map();
+  /** Daemon-level cron scheduler registry: one CronScheduler per enabled agent. */
+  private cronSchedulers: Map<string, CronScheduler> = new Map();
   // Tracks agents that received a start request while still stopping.
   // stopAgent() honors these after cleanup completes so restart-all is race-free.
   private pendingRestarts: Set<string> = new Set();
@@ -29,11 +35,77 @@ export class AgentManager {
   private frameworkRoot: string;
   private org: string;
 
+  // Set true at construction time if any agent in state/ has a stale
+  // .daemon-crashed marker, meaning the previous daemon process died
+  // abruptly. Used by startAgent() to downgrade the BUG-011 regression
+  // alarm to an info log in the post-crash overlap case (PR #11 only
+  // closed the in-flight stop/start race; crash-restart can legitimately
+  // see overlapping registry state). Cleared after discoverAndStart()
+  // finishes so the next clean restart starts from a known-good baseline.
+  private daemonJustCrashed: boolean = false;
+
   constructor(instanceId: string, ctxRoot: string, frameworkRoot: string, org: string) {
     this.instanceId = instanceId;
     this.ctxRoot = ctxRoot;
     this.frameworkRoot = frameworkRoot;
     this.org = org;
+    this.daemonJustCrashed = this.detectDaemonCrashMarkers();
+    if (this.daemonJustCrashed) {
+      console.log('[agent-manager] Detected .daemon-crashed marker(s) — previous daemon exited abnormally. Will quiet BUG-011 alarm for this startup cycle.');
+    }
+  }
+
+  /**
+   * Scan state/<agent>/.daemon-crashed markers (written by daemon/index.ts:handleFatal).
+   * Presence means the previous daemon process died via uncaughtException
+   * or process.kill rather than a clean shutdown.
+   */
+  private detectDaemonCrashMarkers(): boolean {
+    const stateBase = join(this.ctxRoot, 'state');
+    if (!existsSync(stateBase)) return false;
+    try {
+      const dirs = readdirSync(stateBase, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name);
+      return dirs.some(name => existsSync(join(stateBase, name, '.daemon-crashed')));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Delete .daemon-crashed markers after a successful discoverAndStart pass
+   * AND clear the daemonJustCrashed flag. Once the initial post-crash
+   * discovery has finished, any further startAgent calls — IPC-triggered
+   * agent enables, dashboard restarts, manual restartAgent — represent
+   * normal operation, not post-crash overlap. They should fire the real
+   * BUG-011 alarm, not the quieted variant.
+   *
+   * Called once per daemon startup at the end of discoverAndStart().
+   * Idempotent — if no markers exist, this is a no-op. Wrapped in
+   * best-effort try/catch so a missing dir or permission error never
+   * blocks daemon startup.
+   */
+  private clearDaemonCrashMarkers(): void {
+    if (!this.daemonJustCrashed) return;
+    const stateBase = join(this.ctxRoot, 'state');
+    if (existsSync(stateBase)) {
+      try {
+        const dirs = readdirSync(stateBase, { withFileTypes: true })
+          .filter(d => d.isDirectory())
+          .map(d => d.name);
+        for (const name of dirs) {
+          try {
+            const marker = join(stateBase, name, '.daemon-crashed');
+            if (existsSync(marker)) unlinkSync(marker);
+          } catch { /* per-agent best effort */ }
+        }
+      } catch { /* directory unreadable — leave markers, next clean startup will retry */ }
+    }
+    // Reset the flag so subsequent startAgent calls (IPC enable, dashboard
+    // restart, manual restartAgent) get the real BUG-011 alarm, not the
+    // quieted post-crash variant.
+    this.daemonJustCrashed = false;
   }
 
   /**
@@ -65,6 +137,13 @@ export class AgentManager {
       // of falling back to `this.org` (the daemon's startup org).
       await this.startAgent(name, dir, config, org);
     }
+
+    // Successful startup pass — clear .daemon-crashed markers from disk
+    // AND clear the in-memory daemonJustCrashed flag. After this point,
+    // any further startAgent() calls (IPC enable, dashboard restart, etc)
+    // are normal operation and should fire the real BUG-011 alarm if a
+    // race ever does leak through PR #11's protection.
+    this.clearDaemonCrashMarkers();
   }
 
   /**
@@ -139,6 +218,31 @@ export class AgentManager {
    * spawn each agent in its correct org dir regardless of what
    * `CTX_ORG` the daemon was started with.
    */
+  /**
+   * Synchronously classify a start/stop/restart request before dispatch.
+   *
+   * Lets the IPC handler distinguish DEDUPED (agent already in registry, so
+   * a start is collapsing against an in-flight identical op — or a stop /
+   * restart of an agent that was just removed) from NOT_FOUND (agent never
+   * existed in the registry). The dedup logic in startAgent / stopAgent /
+   * restartAgent is unchanged — this read-only check exists purely to give
+   * the IPC layer enough info to set IPCResponse.code. See issue #346.
+   */
+  inspectAgentOp(op: 'start' | 'stop' | 'restart', name: string): { ok: true } | { ok: false; code: 'DEDUPED' | 'NOT_FOUND'; message: string } {
+    const inRegistry = this.agents.has(name);
+    if (op === 'start') {
+      if (inRegistry) {
+        return { ok: false, code: 'DEDUPED', message: `start request for "${name}" deduped — agent already in registry (in-flight start or already running)` };
+      }
+      return { ok: true };
+    }
+    // stop / restart need the agent to be present
+    if (!inRegistry) {
+      return { ok: false, code: 'NOT_FOUND', message: `agent "${name}" not in registry — cannot ${op}` };
+    }
+    return { ok: true };
+  }
+
   async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
     if (this.agents.has(name)) {
       // BUG-031: this branch was the workaround for the BUG-011 PTY race
@@ -154,7 +258,18 @@ export class AgentManager {
       // the core stability test plan + cycle 2 of PR #13 both confirmed
       // this branch is dormant. Once we have weeks of zero-warning
       // production data, we can delete the queue mechanism entirely.
-      console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: ${name} still in registry during startAgent — pendingRestarts queueing engaged. This should not happen with PR #11 in place.`);
+      if (this.daemonJustCrashed) {
+        // Post-crash startup. The previous daemon exited via
+        // uncaughtException without running stopAll(), so the in-memory
+        // registry from the prior process is gone — but the post-crash
+        // discoverAndStart pass can briefly re-enter startAgent for an
+        // agent whose pendingRestarts entry survived. This is benign and
+        // distinct from the BUG-011 in-flight race PR #11 closed. Log at
+        // info level so operators don't think PR #11 has regressed.
+        console.log(`[agent-manager] ${name} already in registry (post-crash discovery overlap, expected). Queueing restart.`);
+      } else {
+        console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: ${name} still in registry during startAgent — pendingRestarts queueing engaged. This should not happen with PR #11 in place.`);
+      }
       this.pendingRestarts.add(name);
       return;
     }
@@ -201,7 +316,10 @@ export class AgentManager {
     let botToken: string | undefined;
 
     if (existsSync(agentEnvFile)) {
-      const envContent = readFileSync(agentEnvFile, 'utf-8');
+      // stripBom: Windows tooling writes .env with a UTF-8 BOM that breaks
+      // /^BOT_TOKEN=/m when BOT_TOKEN is on line 1 (2026-05-16 silent
+      // smith-not-receiving-Telegram incident). See src/utils/strip-bom.ts.
+      const envContent = stripBom(readFileSync(agentEnvFile, 'utf-8'));
       const botTokenMatch = envContent.match(/^BOT_TOKEN=(.+)$/m);
       const chatIdMatch = envContent.match(/^CHAT_ID=(.+)$/m);
       const allowedUserMatch = envContent.match(/^ALLOWED_USER=(.+)$/m);
@@ -215,10 +333,18 @@ export class AgentManager {
         botToken = undefined;
       }
 
-      // ALLOWED_USER must be a numeric Telegram user ID, not a username
-      if (allowedUserId && !/^\d+$/.test(allowedUserId)) {
-        log(`SECURITY: ALLOWED_USER is not a numeric ID. Telegram user IDs are numbers (e.g. 123456789). Refusing to enable Telegram. Fix the .env file.`);
-        allowedUserId = undefined;
+      // ALLOWED_USER must be one or more numeric Telegram user IDs.
+      // Comma-separated for multi-user (e.g. group chats with Sam + a collaborator).
+      // Whitespace tolerated; any non-numeric token rejects the whole list.
+      if (allowedUserId) {
+        const ids = allowedUserId.split(',').map((s) => s.trim()).filter(Boolean);
+        if (ids.length === 0 || !ids.every((id) => /^\d+$/.test(id))) {
+          log(`SECURITY: ALLOWED_USER must be a comma-separated list of numeric Telegram user IDs (e.g. 123456789,987654321). Refusing to enable Telegram. Fix the .env file.`);
+          allowedUserId = undefined;
+        } else {
+          // Normalize to comma-joined form so downstream gate splits on it
+          allowedUserId = ids.join(',');
+        }
       }
 
       // Security: ALLOWED_USER is REQUIRED when BOT_TOKEN is set. Without it,
@@ -227,6 +353,12 @@ export class AgentManager {
       // whitelists their numeric user ID.
       if (botToken && !allowedUserId) {
         log(`SECURITY: BOT_TOKEN is set but ALLOWED_USER is missing. Refusing to enable Telegram. Set ALLOWED_USER to your numeric Telegram user ID in .env, or remove BOT_TOKEN to start the agent without Telegram.`);
+        if (chatId) {
+          const alertApi = new TelegramAPI(botToken);
+          alertApi.sendMessage(chatId,
+            `⚠️ WATCHDOG: ${name} has BOT_TOKEN but ALLOWED_USER is missing or malformed in .env. Telegram is DISABLED for this agent. Fix ALLOWED_USER and restart.`,
+          ).catch(() => {});
+        }
         botToken = undefined;
       }
 
@@ -238,11 +370,19 @@ export class AgentManager {
     }
 
     const agentProcess = new AgentProcess(name, env, config, log);
+    // Issue #330: pass the Telegram handle into AgentProcess so CodexAppServerPTY
+    // can emit sendChatAction directly from the JSONL stream. Has no effect for
+    // claude-code / hermes runtimes — those still use fast-checker.
+    if (telegramApi && chatId) {
+      agentProcess.setTelegramHandle(telegramApi, chatId);
+    }
     const checker = new FastChecker(agentProcess, paths, this.frameworkRoot, {
       log,
       telegramApi,
       chatId,
-      allowedUserId: allowedUserId ? parseInt(allowedUserId, 10) : undefined,
+      // FastChecker only needs the first ID for its single-recipient typing
+      // indicator / quick-checks. Multi-user is enforced by the gates above.
+      allowedUserId: allowedUserId ? parseInt(allowedUserId.split(',')[0].trim(), 10) : undefined,
     });
 
     // Send Telegram notification on crashes and session refreshes
@@ -268,14 +408,19 @@ export class AgentManager {
     // Start agent
     await agentProcess.start();
 
-    // Schedule background cron verification: waits for the agent to finish
-    // its startup turn (idle flag), then injects a prompt to verify CronList
-    // matches config.json. Handles both fresh and --continue restarts safely.
-    agentProcess.scheduleCronVerification();
+    // Subtask 2.2: Auto-migrate crons from config.json → crons.json before
+    // starting the scheduler, so the scheduler always has a populated crons.json
+    // to read from.  The migration is idempotent (marker file prevents re-runs).
+    const configJsonPath = join(agentDir, 'config.json');
+    migrateCronsForAgent(name, configJsonPath, this.ctxRoot, {
+      log: (msg) => log(`[migration] ${msg}`),
+    });
 
-    // Schedule background cron gap detection: polls cron-state.json every 10 min
-    // and nudges the agent if any cron has been silent >2x its expected interval.
-    agentProcess.scheduleGapDetection();
+    // Wire daemon-level CronScheduler for this agent.
+    // The scheduler reads crons.json, fires crons, and injects prompts into
+    // the agent PTY via injectAgent().  This is the Phase 2 daemon-managed
+    // external cron system — agents no longer need to call CronCreate on boot.
+    this.startAgentCronScheduler(name);
 
     // Start fast checker in background
     checker.start().catch(err => {
@@ -293,36 +438,64 @@ export class AgentManager {
       }).catch(() => { /* non-fatal */ });
     }
 
-    // Start Telegram poller if credentials are available
-    if (telegramApi && chatId) {
+    // Start Telegram poller if credentials are available and not explicitly disabled.
+    // Set telegram_polling: false in config.json to prevent a specialist agent from
+    // running its own poller (only the designated orchestrator agent should poll).
+    if (telegramApi && chatId && config.telegram_polling !== false) {
       const stateDir = join(this.ctxRoot, 'state', name);
       const poller = new TelegramPoller(telegramApi, stateDir);
 
+      const REJECT_ALERT_THRESHOLD = 3;
+      const REJECT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+
       poller.onMessage((msg) => {
-        // ALLOWED_USER gate: if configured, ignore messages from other users.
-        // Use numeric comparison to avoid string coercion issues.
+        // ALLOWED_USER gate: comma-separated list of numeric user IDs.
+        // If configured, ignore messages from other users. Always log the
+        // rejected user_id + name so operators can discover IDs to whitelist.
         if (allowedUserId) {
-          const allowedId = parseInt(allowedUserId, 10);
-          if (msg.from?.id !== allowedId) {
-            log(`Ignoring message from unauthorized user (allowed_user gate)`);
+          const allowedIds = allowedUserId.split(',').map((s) => parseInt(s.trim(), 10));
+          const fromId = msg.from?.id;
+          if (typeof fromId !== 'number' || !allowedIds.includes(fromId)) {
+            const rejectedFrom = msg.from?.first_name || msg.from?.username || 'unknown';
+            log(`Ignoring message from unauthorized user (allowed_user gate): from=${fromId} (${rejectedFrom})`);
+            // #459 reject-count watchdog: alert after N consecutive rejects (multi-user gate from #467 preserved).
+            const entry = this.agents.get(name);
+            if (entry) {
+              entry.telegramRejectCount = (entry.telegramRejectCount ?? 0) + 1;
+              if (entry.telegramRejectCount >= REJECT_ALERT_THRESHOLD) {
+                const now = Date.now();
+                const lastAlert = entry.telegramLastRejectAlertAt ?? 0;
+                if (now - lastAlert > REJECT_ALERT_COOLDOWN_MS) {
+                  entry.telegramLastRejectAlertAt = now;
+                  const alertText = `⚠️ WATCHDOG: ${name} rejected ${entry.telegramRejectCount} consecutive Telegram messages (ALLOWED_USER gate). Last from_id: ${fromId ?? 'unknown'}. Verify ALLOWED_USER in .env matches expected users, or this may be unsolicited contact.`;
+                  log(alertText);
+                  if (telegramApi && chatId) {
+                    telegramApi.sendMessage(chatId, alertText).catch(() => {});
+                  }
+                }
+              }
+            }
             return;
           }
         }
+
+        // Message passed ALLOWED_USER gate — reset rejection counter.
+        const agentEntry = this.agents.get(name);
+        if (agentEntry) agentEntry.telegramRejectCount = 0;
 
         const from = stripControlChars(msg.from?.first_name || msg.from?.username || 'Unknown');
         const msgChatId = msg.chat?.id;
         const effectiveChatId = msgChatId ?? chatId ?? '';
         const stateDir = join(this.ctxRoot, 'state', name);
 
-        // Log inbound message to JSONL
-        logInboundMessage(this.ctxRoot, name, {
-          message_id: msg.message_id,
-          from: msg.from?.id,
-          from_name: from,
-          chat_id: msgChatId,
-          text: stripControlChars(msg.text || msg.caption || ''),
-          timestamp: new Date().toISOString(),
-        });
+        // Persist the inbound message to JSONL AND emit a
+        // `message/telegram_received` bus event in one helper so
+        // experiment cycles and dashboards can count inbound traffic.
+        // Without the event, Rubi's v3 fleet measurement found 0
+        // inbound messages on a window where Eros replied to multiple
+        // agents — the JSONL had the data but it never reached the
+        // event log.
+        recordInboundTelegram(paths, this.ctxRoot, name, resolvedOrg, from, msg, log);
 
         // Check for media messages (photo, document, voice, audio, video, video_note)
         const isMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
@@ -355,7 +528,7 @@ export class AgentManager {
             } else if (media.type === 'document') {
               formatted = FastChecker.formatTelegramDocumentMessage(from, effectiveChatId, media.text, relFilePath, media.file_name!);
             } else if (media.type === 'voice' || media.type === 'audio') {
-              formatted = FastChecker.formatTelegramVoiceMessage(from, effectiveChatId, relFilePath, media.duration);
+              formatted = FastChecker.formatTelegramVoiceMessage(from, effectiveChatId, relFilePath, media.duration, media.transcript);
             } else {
               // video or video_note
               formatted = FastChecker.formatTelegramVideoMessage(from, effectiveChatId, media.text, relFilePath, media.file_name || '', media.duration);
@@ -409,15 +582,35 @@ export class AgentManager {
       });
 
       poller.onReaction((reaction) => {
-        // ALLOWED_USER gate: same rule as message handler. If configured,
-        // ignore reactions from other users.
+        // ALLOWED_USER gate: same multi-user rule as message handler.
         if (allowedUserId) {
-          const allowedId = parseInt(allowedUserId, 10);
-          if (reaction.user?.id !== allowedId) {
-            log('Ignoring reaction from unauthorized user (allowed_user gate)');
+          const allowedIds = allowedUserId.split(',').map((s) => parseInt(s.trim(), 10));
+          const fromId = reaction.user?.id;
+          if (typeof fromId !== 'number' || !allowedIds.includes(fromId)) {
+            log(`Ignoring reaction from unauthorized user (allowed_user gate): from=${fromId}`);
+            // #459 reject-count watchdog (multi-user gate from #467 preserved).
+            const entry = this.agents.get(name);
+            if (entry) {
+              entry.telegramRejectCount = (entry.telegramRejectCount ?? 0) + 1;
+              if (entry.telegramRejectCount >= REJECT_ALERT_THRESHOLD) {
+                const now = Date.now();
+                const lastAlert = entry.telegramLastRejectAlertAt ?? 0;
+                if (now - lastAlert > REJECT_ALERT_COOLDOWN_MS) {
+                  entry.telegramLastRejectAlertAt = now;
+                  const alertText = `⚠️ WATCHDOG: ${name} rejected ${entry.telegramRejectCount} consecutive Telegram interactions (ALLOWED_USER gate). Verify ALLOWED_USER in .env matches expected users, or this may be unsolicited contact.`;
+                  log(alertText);
+                  if (telegramApi && chatId) {
+                    telegramApi.sendMessage(chatId, alertText).catch(() => {});
+                  }
+                }
+              }
+            }
             return;
           }
         }
+
+        const agentEntry = this.agents.get(name);
+        if (agentEntry) agentEntry.telegramRejectCount = 0;
 
         const from = stripControlChars(reaction.user?.first_name || reaction.user?.username || 'Unknown');
         const reactionChatId = reaction.chat?.id ?? chatId ?? '';
@@ -435,15 +628,71 @@ export class AgentManager {
         checker.queueTelegramMessage(formatted);
       });
 
-      poller.start().catch(err => {
-        log(`Telegram poller error: ${err}`);
+      // Wrap poller.start() in a restart-on-Conflict loop. The poller's
+      // internal Conflict-self-die (see TelegramPoller.start) yields the
+      // Telegram getUpdates lock when a duplicate poller is detected — but
+      // without a restart layer above, the agent loses Telegram input
+      // permanently. After a daemon crash, the old getUpdates connections
+      // can hold the lock for ~60s in Telegram's cloud, so this loop
+      // sleeps and retries on 'conflict-self-die' until the lock clears.
+      // Intentional stops (stopAgent → poller.stop()) set
+      // lastExitReason='stopped-externally' and exit the loop cleanly.
+      const startPrimaryPollerWithRestart = async () => {
+        // 5min hard cap measured against CONSECUTIVE Conflict failures,
+        // not total wrapper lifetime. A long-running successful poll
+        // (>1min) resets the counter — without this reset, a poller that
+        // runs cleanly for hours and then hits a single Conflict would
+        // give up immediately because total runtime already exceeds 5min.
+        const MAX_CONSECUTIVE_CONFLICT_MS = 5 * 60 * 1000;
+        const LONG_RUN_RESET_MS = 60_000;
+        let consecutiveConflictStart: number | null = null;
+        while (true) {
+          // Pre-check: agent may have been deleted from registry during
+          // a previous sleep window. Skip the start() call entirely.
+          if (!this.agents.has(name)) return;
+          const runStart = Date.now();
+          try {
+            await poller.start();
+          } catch (err) {
+            log(`Telegram poller threw (will not restart): ${err}`);
+            return;
+          }
+          const runDuration = Date.now() - runStart;
+          if (poller.lastExitReason === 'stopped-externally') return;
+          if (!this.agents.has(name)) return;
+          // A poll session that ran for >LONG_RUN_RESET_MS proves the
+          // Conflict lock is no longer chronic — reset the retry budget.
+          if (runDuration > LONG_RUN_RESET_MS) consecutiveConflictStart = null;
+          if (consecutiveConflictStart === null) consecutiveConflictStart = Date.now();
+          if (Date.now() - consecutiveConflictStart > MAX_CONSECUTIVE_CONFLICT_MS) {
+            log(`Telegram poller for ${name} could not clear Conflict within 5min of consecutive failures — giving up. Inspect for duplicate bot instance.`);
+            return;
+          }
+          log(`Telegram poller for ${name} exited (${poller.lastExitReason}). Sleeping 30s then restarting to retake getUpdates lock.`);
+          await new Promise(r => setTimeout(r, 30_000));
+        }
+      };
+      startPrimaryPollerWithRestart().catch(err => {
+        log(`Telegram poller wrapper crashed: ${err}`);
+        // Best-effort operator alert via the agent's own bot. The wrapper
+        // crashing is rare (the only catchable path is a throw from
+        // poller.start() before its own try/catch), but when it happens the
+        // agent silently loses Telegram input — exactly the failure class
+        // the 2026-05-16 audit flagged. Surface it to the operator chat so
+        // they see "X poller crashed" instead of mysterious silence.
+        if (telegramApi && chatId) {
+          telegramApi.sendMessage(
+            String(chatId),
+            `${name}: Telegram poller wrapper crashed. Inbound messages may be dropped until restart. Check daemon log.`,
+          ).catch(() => { /* swallow alert failure; original log already captured */ });
+        }
       });
 
       // Store poller reference so stopAgent() can clean it up
       const entry = this.agents.get(name);
       if (entry) entry.poller = poller;
 
-      log('Telegram poller started');
+      log('Telegram poller started (with Conflict-restart wrapper)');
 
       // Orchestrator-only: start a second poller for the org's activity
       // channel bot so Telegram inline-button callbacks (currently just
@@ -479,7 +728,8 @@ export class AgentManager {
     // Only the org's orchestrator runs the activity-channel poller.
     let orchestratorName: string | undefined;
     try {
-      const contextJson = readFileSync(join(orgDir, 'context.json'), 'utf-8');
+      // stripBom: see src/utils/strip-bom.ts for incident context.
+      const contextJson = stripBom(readFileSync(join(orgDir, 'context.json'), 'utf-8'));
       orchestratorName = JSON.parse(contextJson).orchestrator;
     } catch {
       return; // No context.json or unreadable — skip
@@ -491,8 +741,11 @@ export class AgentManager {
     let activityBotToken: string | undefined;
     let activityChatId: string | undefined;
     try {
-      const content = readFileSync(activityEnvPath, 'utf-8');
-      for (const line of content.split('\n')) {
+      // stripBom + CRLF-aware split: Windows tooling writes activity-channel.env
+      // with BOM + CRLF. Without these, ACTIVITY_BOT_TOKEN never resolves
+      // and the activity-channel poller silently never starts.
+      const content = stripBom(readFileSync(activityEnvPath, 'utf-8'));
+      for (const line of content.split(/\r?\n/)) {
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith('#')) continue;
         const eqIdx = trimmed.indexOf('=');
@@ -535,14 +788,44 @@ export class AgentManager {
       log(`[activity-channel inbound] from ${from}: ${text.slice(0, 120)}`);
     });
 
-    activityPoller.start().catch((err) => {
-      log(`Activity-channel poller error: ${err}`);
+    // Same Conflict-restart wrapper as the primary poller — activity
+    // channel can lose its getUpdates lock after a daemon crash too.
+    // 5min retry budget measured against CONSECUTIVE failures; resets
+    // after a >1min successful run. See primary poller wrapper for rationale.
+    const startActivityPollerWithRestart = async () => {
+      const MAX_CONSECUTIVE_CONFLICT_MS = 5 * 60 * 1000;
+      const LONG_RUN_RESET_MS = 60_000;
+      let consecutiveConflictStart: number | null = null;
+      while (true) {
+        if (!this.agents.has(name)) return;
+        const runStart = Date.now();
+        try {
+          await activityPoller.start();
+        } catch (err) {
+          log(`Activity-channel poller threw (will not restart): ${err}`);
+          return;
+        }
+        const runDuration = Date.now() - runStart;
+        if (activityPoller.lastExitReason === 'stopped-externally') return;
+        if (!this.agents.has(name)) return;
+        if (runDuration > LONG_RUN_RESET_MS) consecutiveConflictStart = null;
+        if (consecutiveConflictStart === null) consecutiveConflictStart = Date.now();
+        if (Date.now() - consecutiveConflictStart > MAX_CONSECUTIVE_CONFLICT_MS) {
+          log(`Activity-channel poller for ${name} could not clear Conflict within 5min of consecutive failures — giving up.`);
+          return;
+        }
+        log(`Activity-channel poller for ${name} exited (${activityPoller.lastExitReason}). Sleeping 30s then restarting.`);
+        await new Promise(r => setTimeout(r, 30_000));
+      }
+    };
+    startActivityPollerWithRestart().catch((err) => {
+      log(`Activity-channel poller wrapper crashed: ${err}`);
     });
 
     const entry = this.agents.get(name);
     if (entry) entry.activityPoller = activityPoller;
 
-    log(`Activity-channel poller started (chat ${activityChatId})`);
+    log(`Activity-channel poller started (chat ${activityChatId}, with Conflict-restart wrapper)`);
   }
 
   /**
@@ -561,13 +844,24 @@ export class AgentManager {
     await entry.process.stop();
     this.agents.delete(name);
 
+    // Stop and remove the agent's cron scheduler (if one was wired)
+    const scheduler = this.cronSchedulers.get(name);
+    if (scheduler) {
+      scheduler.stop();
+      this.cronSchedulers.delete(name);
+    }
+
     // BUG-031: honor any restart that was queued while we were stopping.
     // After PR #11 (BUG-011 fix) this branch should never fire — see the
     // matching warning comment in startAgent(). The honor logic is preserved
     // as a safety net in case BUG-011 regresses; the warn line tells us
     // immediately if it ever does.
     if (this.pendingRestarts.has(name)) {
-      console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: pendingRestarts fired for ${name} — race condition leaked through. Honoring queued restart as safety net.`);
+      if (this.daemonJustCrashed) {
+        console.log(`[agent-manager] pendingRestarts fired for ${name} (post-crash safety net, expected). Honoring queued restart.`);
+      } else {
+        console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: pendingRestarts fired for ${name} — race condition leaked through. Honoring queued restart as safety net.`);
+      }
       this.pendingRestarts.delete(name);
       console.log(`[agent-manager] Honoring queued restart for ${name}`);
       this.startAgent(name, '').catch(err =>
@@ -670,6 +964,14 @@ export class AgentManager {
     return [...this.agents.keys()];
   }
 
+  /**
+   * Return the CronScheduler for a given agent (for testing / introspection).
+   * Returns undefined if no scheduler is running for that agent.
+   */
+  getCronScheduler(agentName: string): CronScheduler | undefined {
+    return this.cronSchedulers.get(agentName);
+  }
+
   // --- Worker management ---
 
   /**
@@ -710,7 +1012,7 @@ export class AgentManager {
       }, 30_000); // keep for 30s after exit
     });
 
-    await worker.spawn({ ...env, ...(model ? {} : {}) }, prompt);
+    await worker.spawn(env, prompt, config);
   }
 
   /**
@@ -732,6 +1034,129 @@ export class AgentManager {
     const worker = this.workers.get(name);
     if (!worker) return false;
     return worker.inject(text);
+  }
+
+  /**
+   * Inject text directly into a running agent's PTY.
+   * Used by `cortextos bus test-cron-fire` to fire a cron immediately for testing.
+   * Returns true if the agent is running and the inject succeeded; false otherwise.
+   */
+  injectAgent(agentName: string, text: string): boolean {
+    return this.injectAgentDetailed(agentName, text).ok;
+  }
+
+  /**
+   * Inject text into an agent's PTY with structured outcome — issue #346.
+   *
+   * Returns NOT_FOUND if the agent isn't in the registry, NOT_RUNNING if
+   * registered but the PTY is gone, DEDUPED on a MessageDedup hash hit. The
+   * boolean-returning `injectAgent()` is preserved for callers (cron
+   * scheduler, fast-checker, fire-cron) that only need pass/fail.
+   */
+  injectAgentDetailed(agentName: string, text: string): { ok: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING' | 'DEDUPED'; message: string } {
+    const entry = this.agents.get(agentName);
+    if (!entry) {
+      return { ok: false, code: 'NOT_FOUND', message: `agent "${agentName}" not in registry` };
+    }
+    return entry.process.injectMessageDetailed(text);
+  }
+
+  /**
+   * Signal the CronScheduler for an agent to re-read crons.json.
+   *
+   * Called by the IPC server after a `bus add-cron` / `bus remove-cron` write so
+   * the daemon-level scheduler picks up the new definition without waiting for
+   * the next 30 s tick.  Returns true on a successful reload (or no-op for
+   * Hermes agents, which manage their own crons natively); false if the agent
+   * is not running at all.
+   *
+   * Iter 7 fix: previously this returned `true` for any registered agent even
+   * when no scheduler existed in `cronSchedulers`, silently dropping reload
+   * requests during the start-window gap between `this.agents.set(name, ...)`
+   * and `startAgentCronScheduler(name)` (across the `await agentProcess.start()`
+   * yield in `startAgent`). Now: for non-Hermes agents that lack a scheduler we
+   * lazy-wire one so the just-written crons.json is read immediately.
+   */
+  reloadCrons(agentName: string): boolean {
+    const scheduler = this.cronSchedulers.get(agentName);
+    if (scheduler) {
+      scheduler.reload();
+      console.log(`[agent-manager] Cron scheduler reloaded for ${agentName}`);
+      return true;
+    }
+
+    const entry = this.agents.get(agentName);
+    if (!entry) return false;
+
+    // Hermes manages its own crons natively — no daemon scheduler exists by
+    // design. The reload IS a no-op; report success so the caller does not
+    // retry forever.
+    if (entry.process['config']?.runtime === 'hermes') {
+      return true;
+    }
+
+    // Non-Hermes agent registered but no scheduler: this is the start-window
+    // gap. Lazy-wire the scheduler now; its start() reads crons.json which
+    // already contains the new entry the caller just wrote.
+    this.startAgentCronScheduler(agentName);
+    console.log(`[agent-manager] Cron scheduler lazy-created for ${agentName} (start-window reload)`);
+    return this.cronSchedulers.has(agentName);
+  }
+
+  /**
+   * Wire a daemon-level CronScheduler for the named agent.
+   *
+   * The scheduler reads `crons.json` (via `readCrons()`), computes fire times,
+   * and on each tick injects the cron's prompt text directly into the agent PTY
+   * via `injectAgent()`.  The fire callback builds the same injected text that
+   * a Claude-Code `CronCreate` callback would emit so the agent's session sees
+   * a normal-looking cron-fire message and handles it with existing skill code.
+   *
+   * Hermes agents manage their own cron system natively — skip them here.
+   * If crons.json is absent or empty the scheduler starts but has nothing to do;
+   * it will pick up new entries on the next `reloadCrons()` call.
+   */
+  private startAgentCronScheduler(agentName: string): void {
+    // Skip if already running (idempotent — e.g. called twice on fast restart)
+    if (this.cronSchedulers.has(agentName)) {
+      console.log(`[agent-manager] Cron scheduler already running for ${agentName} — skipped`);
+      return;
+    }
+
+    const entry = this.agents.get(agentName);
+    if (!entry) return;
+
+    // Hermes manages its own cron scheduling — don't double-schedule
+    if (entry.process['config']?.runtime === 'hermes') {
+      console.log(`[daemon] Skipping external cron scheduler for Hermes agent "${agentName}"`);
+      return;
+    }
+
+    const onFire = async (cron: CronDefinition): Promise<void> => {
+      const prompt = cron.prompt ?? `[cron] ${cron.name} fired`;
+      // Salt with the fire timestamp so MessageDedup (which hashes the last 100
+      // injects) does not reject identical cron prompts on subsequent fires.
+      // Without the salt, every recurring cron after its first fire would be
+      // dedup-rejected and treated as a dispatch failure.
+      const firedAt = new Date().toISOString();
+      const injection = `[CRON FIRED ${firedAt}] ${cron.name}: ${prompt}`;
+      const injected = this.injectAgent(agentName, injection);
+      if (!injected) {
+        throw new Error(`injectAgent returned false for agent "${agentName}" — agent may not be running`);
+      }
+    };
+
+    const scheduler = new CronScheduler({
+      agentName,
+      onFire,
+      logger: (msg) => console.log(`[daemon] ${msg}`),
+    });
+
+    scheduler.start();
+    this.cronSchedulers.set(agentName, scheduler);
+
+    const count = scheduler.getNextFireTimes().length;
+    console.log(`[daemon] Loaded ${count} external cron(s) for agent "${agentName}" from crons.json`);
   }
 
   /**
@@ -801,17 +1226,44 @@ export class AgentManager {
 
   /**
    * Load agent config from config.json.
+   *
+   * On parse error: log a clear, operator-actionable error to stderr (file path,
+   * SyntaxError message, and a 1-line offending-snippet hint when locatable) and
+   * fall back to default config so the daemon does not hard-crash. Without this
+   * surfacing, a trailing comma in config.json silently degrades the agent into
+   * a "model not available" state because the model field is missing — see #345.
    */
   private loadAgentConfig(agentDir: string): AgentConfig {
     const configPath = join(agentDir, 'config.json');
+    if (!existsSync(configPath)) return {};
+    let raw: string;
     try {
-      if (existsSync(configPath)) {
-        return JSON.parse(readFileSync(configPath, 'utf-8'));
-      }
-    } catch {
-      // Ignore parse errors
+      raw = readFileSync(configPath, 'utf-8');
+    } catch (err) {
+      console.error(`[agent-manager] config read failed: ${configPath}: ${(err as Error).message}`);
+      return {};
     }
-    return {}; // Default config
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      const msg = (err as SyntaxError).message;
+      // Best-effort line/column extraction from V8 SyntaxError messages.
+      // V8 emits "Unexpected token ... in JSON at position N" — we resolve
+      // N back to a 1-indexed line/column so operators can jump to the offender.
+      const posMatch = /position (\d+)/.exec(msg);
+      let locHint = '';
+      if (posMatch) {
+        const pos = Math.min(Number(posMatch[1]), raw.length);
+        const before = raw.slice(0, pos);
+        const line = before.split('\n').length;
+        const col = pos - (before.lastIndexOf('\n') + 1) + 1;
+        const offendingLine = raw.split('\n')[line - 1] || '';
+        locHint = ` (line ${line}, col ${col}: \`${offendingLine.trim().slice(0, 80)}\`)`;
+      }
+      console.error(`[agent-manager] config.json invalid JSON: ${configPath}${locHint}: ${msg}`);
+      console.error(`[agent-manager] hint: trailing commas, unquoted keys, and single quotes are common causes`);
+      return {};
+    }
   }
 }
 
