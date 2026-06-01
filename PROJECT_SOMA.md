@@ -826,3 +826,20 @@ Linear journal. Append-only. Each entry: date, one-line summary, what happened, 
 - **Pending: fleet rollout.** Stage B: replicate the same `.env` + `config.json` change across the other 7 agents (`content`, `finance`, `marketing`, `operations`, `product`, `sales`, `analyst`), each followed by a hard-restart, staggered by 1–2 min to avoid simultaneous reconnect storms. Awaiting Jens's staging-strategy answer before proceeding.
 - **Optional polish (deferred):** enhance the daemon-injected handoff prompt template (`fast-checker.ts:979`) — current is minimal headers; the Stage A handoff doc demonstrates a richer reinforcement pattern that could ship as the default.
 - **No source-code changes.** Pure agent-level config/env. HITL boundary (`src/pty/agent-pty.ts` env allowlist) untouched.
+
+### 2026-05-31 — Upstream sync: 108 commits from cortextOS merged into SOMA
+
+- **Context.** First upstream sync since the 2026-04-23 fork point (`eb119a9`). `grandamenium/cortextos@a89cee2` had advanced 108 commits; SOMA had 46 of its own (rename sweep + Phase-1 API engine/jobs/tools). 82 files overlapped.
+- **Method (per `upstream-sync` SKILL + ADR-driven HITL).** Worked on throwaway branch `soma/sync-upstream-2026-05-31` off the `soma/phase-1-minions` tip — never on the working branch until validated. Single `git merge upstream/main`; git auto-merged 75 of 82 overlapping files.
+- **What landed from upstream.** External persistent crons (daemon-owned scheduler + dashboard workflows UI, ~38 commits); ~11 daemon stability fixes (crash false-positives, image-poison recovery, silent-failure/BOM/PATH audit); dashboard auth-bypass fix (#547); codex-app-server runtime parity; telegram multi-user + whisper transcription; hooks framework; new community skills.
+- **7 conflicts resolved — SOMA divergence preserved, upstream function adopted:**
+  - `src/cli/index.ts` — kept `jobs` command + upstream `import-agent`/`update`.
+  - `src/cli/ecosystem.ts` — kept `SOMA-dashboard` PM2 name + upstream Windows-safe `dashboardScript`/`dashboardArgs`.
+  - `dashboard/src/lib/cost-parser.ts` — SOMA brand header + upstream codex-token parsing.
+  - `dashboard/src/components/layout/sidebar.tsx` — kept both nav icons (`IconStack2` + `IconNotes`).
+  - `dashboard/src/app/(dashboard)/workflows/page.tsx` — took upstream's crons UI rewrite (SOMA's only delta was a 2-line color sweep); re-applied ADR-010 monochrome tokens on top (`red-*` → `destructive`).
+  - `tests/unit/telegram/media.test.ts` — SOMA temp-dir prefix + upstream transcription-disable setup.
+  - `README.md` — kept SOMA's deliberate rewrite.
+- **Validation.** Root + `dashboard/` `tsc --noEmit` clean; 1379 unit/minions/sprint/cli vitest cases pass. 12 failures (`tests/unit/cli/lifecycle-markers`, `enable-agent-validation`, `hooks/extract-facts`) are **pre-existing rename debt** (`.cortextos`→`.soma`, `SOMA` keyword) — proven identical on pre-merge SOMA via a detached worktree run; not introduced by this merge. Integration/e2e suites (live `claude`/`codex` runtimes) not run.
+- **Merge commit** `74374c5` (parents `27bf8e3` + `a89cee2`).
+- **Follow-up (separate from sync):** fix the 12 stale `.cortextos`→`.soma` test assertions so the discipline suite goes fully green. The newly-merged crons subsystem overlaps Phase-1 minions/queue work — confirm coexistence before building further on either.
